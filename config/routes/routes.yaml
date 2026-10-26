@@ -1,0 +1,3 @@
+api_admin_login:
+    path: /api/admin/login
+    methods: [POST]
