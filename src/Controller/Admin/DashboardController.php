@@ -205,7 +205,8 @@ final class DashboardController extends AbstractController
                 'SELECT COUNT(*) FROM buses WHERE is_active = 1 AND ((insurance_expires_on IS NOT NULL AND insurance_expires_on <= ?)
                    OR (inspection_expires_on IS NOT NULL AND inspection_expires_on <= ?))', [$limit, $limit]),
             'docs_drivers' => (int) $this->db->fetchOne('SELECT COUNT(*) FROM drivers WHERE is_active = 1 AND license_expires_on <= ?', [$limit]),
-        ];
+        'transport_new' => (int) $this->db->fetchOne("SELECT COUNT(*) FROM transport_requests WHERE status = 'new'"),
+            ];
     }
 
     private function alerts(): array
@@ -307,7 +308,8 @@ final class DashboardController extends AbstractController
             $l[] = $this->item('docs_buses', 'Bus : assurance ou visite technique à renouveler', $f['docs_buses'], 'warn', '/fleet/buses?docs=expiring');
             $l[] = $this->item('docs_drivers', 'Chauffeurs : permis à renouveler', $f['docs_drivers'], 'warn', '/fleet/drivers?docs=expiring');
             $l[] = $this->item('no_bus', 'Chauffeurs sans bus attribué', $f['drivers']['without_bus'], 'info', '/fleet/drivers?bus=none');
-        }
+            $l[] = $this->item('transport', 'Demandes de location de bus à traiter', $f['transport_new'], 'warn', '/fleet/transport');
+            }
         return $this->build($l);
     }
 
