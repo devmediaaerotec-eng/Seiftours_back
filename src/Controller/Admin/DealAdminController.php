@@ -37,6 +37,7 @@ final class DealAdminController extends AbstractCatalogController
                 'price_millimes'     => ['type' => 'int', 'min' => 0],
                 'currency'           => ['type' => 'enum', 'values' => ['TND', 'EUR', 'USD'], 'default' => 'TND'],
                 'image_url'          => ['type' => 'string', 'max' => 500],
+                'link_url'           => ['type' => 'string', 'max' => 500],
                 'valid_from'         => ['type' => 'date'],
                 'valid_until'        => ['type' => 'date'],
                 'is_featured'        => ['type' => 'bool', 'default' => false],
@@ -53,10 +54,13 @@ final class DealAdminController extends AbstractCatalogController
             $e = [];
             $hasTrip = !empty($row['trip_id']);
             $hasHotel = !empty($row['hotel_id']);
-            if (!$hasTrip && !$hasHotel) {
-                $e['target'] = 'Choisissez un voyage ou un hôtel.';
-            } elseif ($hasTrip && $hasHotel) {
+            // Ni voyage ni hôtel = offre libre (autorisée)
+            if ($hasTrip && $hasHotel) {
                 $e['target'] = 'Une offre vise un voyage OU un hôtel, pas les deux.';
+            }
+            $link = trim((string) ($row['link_url'] ?? ''));
+            if ($link !== '' && !preg_match('#^(https?://|/)#i', $link)) {
+                $e['link_url'] = 'Lien invalide (https://… ou /page).';
             }
             if ($row['old_price_millimes'] !== null && $row['price_millimes'] !== null
                 && $row['old_price_millimes'] <= $row['price_millimes']) {
