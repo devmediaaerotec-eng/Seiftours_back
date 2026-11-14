@@ -5,9 +5,11 @@ use Doctrine\DBAL\Connection;
 
 final class MissionService
 {
+
+    public const LEGS = ['aller', 'retour', 'other'];
     public const TYPES    = ['rental', 'transfer', 'excursion', 'circuit', 'shuttle', 'other'];
     public const STATUSES = ['planned', 'in_progress', 'completed', 'not_done', 'cancelled'];
-    /** Statuts qui occupent le bus et le chauffeur. */
+
     public const ACTIVE   = ['planned', 'in_progress', 'completed'];
 
     private const STATUS_LABELS = [
@@ -231,7 +233,7 @@ final class MissionService
                     $errors['bus_id'] ??= "Ce bus est déjà pris : mission {$c['reference']} ($when).";
                 }
                 if ((int) $c['driver_id'] === $row['driver_id']) {
-                    $errors['driver_id'] ??= "Ce chauffeur est déjà pris : mission {$c['reference']} ($when).";
+                    $warnings[] = 'Ce chauffeur a déjà une mission sur cette période : ' . $this->describeConflict($c);
                 }
             }
         }
@@ -256,22 +258,31 @@ final class MissionService
     }
 
     /** Bus et chauffeurs déjà pris sur une période (pour griser les listes du formulaire). */
-    public function busy(string $start, string $end, int $exclude = 0): array
-    {
-        $rows = $this->db->fetchAllAssociative(
-            "SELECT reference, title, bus_id, driver_id, starts_at, ends_at
-             FROM bus_missions
-             WHERE id <> ? AND status IN ('planned','in_progress','completed') AND starts_at < ? AND ends_at > ?",
-            [$exclude, $end, $start]
-        );
-        $out = ['buses' => [], 'drivers' => []];
-        foreach ($rows as $r) {
-            $info = ['reference' => $r['reference'], 'title' => $r['title'], 'starts_at' => $r['starts_at'], 'ends_at' => $r['ends_at']];
-            $out['buses'][(int) $r['bus_id']]       ??= $info;
-            $out['drivers'][(int) $r['driver_id']]  ??= $info;
-        }
-        return $out;
+
+    /**
+ * Bus et chauffeurs déjà pris sur une période.
+ * - buses   : occupés = bloquants (un bus ne peut pas être à deux endroits)
+ * - drivers : chevauchements = simple avertissement (un chauffeur peut enchaîner aller / retour)
+ * - load    : nombre de missions du chauffeur sur la période
+ */
+public function busy(string $start, string $end, int $exclude = 0): array
+{
+    $rows = $this->db->fetchAllAssociative(
+        "SELECT reference, title, bus_id, driver_id, starts_at, ends_at
+         FROM bus_missions
+         WHERE id <> ? AND status IN ('planned','in_progress','completed') AND starts_at < ? AND ends_at > ?
+         ORDER BY starts_at",
+        [$exclude, $end, $start]
+    );
+    $out = ['buses' => [], 'drivers' => [], 'load' => []];
+    foreach ($rows as $r) {
+        $info = ['reference' => $r['reference'], 'title' => $r['title'], 'starts_at' => $r['starts_at'], 'ends_at' => $r['ends_at']];
+        $out['buses'][(int) $r['bus_id']]      ??= $info;
+        $out['drivers'][(int) $r['driver_id']] ??= $info;
+        $out['load'][(int) $r['driver_id']]     = ($out['load'][(int) $r['driver_id']] ?? 0) + 1;
     }
+    return $out;
+}
 
     /** Verrouille le bus et le chauffeur pour éviter deux affectations simultanées. */
     public function lock(mixed $busId, mixed $driverId): void
@@ -390,45 +401,68 @@ final class MissionService
 
     // ----------------------------------------------------- message au chauffeur
 
-    public function programMessage(string $firstName, \DateTimeImmutable $monday, array $missions): string
-    {
-        $lines = [
-            'Programme du ' . $this->frDay($monday) . ' au ' . $this->frDay($monday->modify('+6 days')) . ' — Seif Tours',
-            '', "Bonjour $firstName,", '',
-        ];
-        $byDay = [];
-        foreach ($missions as $m) {
-            $byDay[max(substr($m['starts_at'], 0, 10), $monday->format('Y-m-d'))][] = $m;
-        }
-        ksort($byDay);
 
-        foreach ($byDay as $day => $list) {
-            $lines[] = $this->frDay(new \DateTimeImmutable($day));
-            foreach ($list as $m) {
-                $s = substr($m['starts_at'], 11, 5);
-                $e = substr($m['ends_at'], 11, 5);
-                $multi = substr($m['starts_at'], 0, 10) !== substr($m['ends_at'], 0, 10);
-                $when = $multi ? "$s → " . $this->frDay(new \DateTimeImmutable($m['ends_at'])) . " $e" : "$s → $e";
-                $lines[] = "• $when — {$m['title']}";
+    /** Message WhatsApp d'un chauffeur : un bloc par jour, une fiche par mission. */
+public function programMessage(string $firstName, \DateTimeImmutable $monday, array $missions): string
+{
+    // Symboles en \u{} : indépendants de l'encodage du fichier
+    $sep   = str_repeat("\u{2501}", 16);
+    $arrow = "\u{2192}";
+    $legs  = ['aller' => 'ALLER', 'retour' => 'RETOUR'];
 
-                $route = implode(' → ', array_filter([$m['pickup_place'], $m['destination']]));
-                $meta = array_filter([
-                    $route ?: null,
-                    "Bus {$m['bus_code']} ({$m['bus_plate']})",
-                    $m['pax'] ? "{$m['pax']} pers." : null,
-                ]);
-                $lines[] = '   ' . implode(' · ', $meta);
-                if ($m['client_name'] || $m['client_phone']) {
-                    $lines[] = '   Client : ' . trim(($m['client_name'] ?? '') . ' ' . ($m['client_phone'] ?? ''));
-                }
-                if ($m['notes']) {
-                    $lines[] = '   Consignes : ' . preg_replace('/\s+/', ' ', $m['notes']);
-                }
-            }
-            $lines[] = '';
-        }
-        $lines[] = 'Merci de confirmer la bonne réception.';
+    $lines = [
+        '*SEIF TOURS | PROGRAMME*',
+        'Du ' . $this->frDay($monday) . ' au ' . $this->frDay($monday->modify('+6 days')),
+        $sep,
+        '',
+        "Bonjour $firstName,",
+        'Voici votre programme de la semaine.',
+    ];
 
-        return implode("\n", $lines);
+    $byDay = [];
+    foreach ($missions as $m) {
+        $byDay[max(substr($m['starts_at'], 0, 10), $monday->format('Y-m-d'))][] = $m;
     }
+    ksort($byDay);
+
+    foreach ($byDay as $day => $list) {
+        usort($list, static fn ($a, $b) => strcmp($a['starts_at'], $b['starts_at']));
+        $lines[] = '';
+        $lines[] = '*' . mb_strtoupper($this->frDay(new \DateTimeImmutable($day))) . '*';
+
+        foreach ($list as $m) {
+            $s = substr($m['starts_at'], 11, 5);
+            $e = substr($m['ends_at'], 11, 5);
+            $multi = substr($m['starts_at'], 0, 10) !== substr($m['ends_at'], 0, 10);
+            $when = $multi ? "$s $arrow " . $this->frDay(new \DateTimeImmutable($m['ends_at'])) . " $e" : "$s $arrow $e";
+            $leg = $legs[$m['leg'] ?? ''] ?? '';
+
+            $lines[] = '';
+            $lines[] = "  *$when*" . ($leg !== '' ? "  $leg" : '');
+            $lines[] = "  Mission : {$m['title']}";
+            if (!empty($m['client_name'])) {
+                $lines[] = "  Client : {$m['client_name']}";
+            }
+            $route = implode(" $arrow ", array_filter([$m['pickup_place'], $m['destination']]));
+            if ($route !== '') {
+                $lines[] = "  Trajet : $route";
+            }
+            $lines[] = "  Bus : {$m['bus_plate']}" . ($m['pax'] ? " ({$m['pax']} pers.)" : '');
+            if (!empty($m['client_phone'])) {
+                $lines[] = "  Contact client : {$m['client_phone']}";
+            }
+            if (!empty($m['notes'])) {
+                $lines[] = '  Consignes : ' . preg_replace('/\s+/', ' ', $m['notes']);
+            }
+        }
+    }
+
+    $lines[] = '';
+    $lines[] = 'Merci de confirmer la bonne réception.';
+    $lines[] = "En cas de retard ou d'empêchement, prévenez-nous sans attendre.";
+    $lines[] = '';
+    $lines[] = '_Seif Tours_';
+
+    return implode("\n", $lines);
+}
 }

@@ -7,9 +7,17 @@ final class PositionService
 {
     public function __construct(private Connection $db) {}
 
-    /** @return array{0: bool, 1: ?string} [accepté, erreur] */
-    public function record(int $busId, float $lat, float $lng, ?float $speed, ?int $heading, ?int $accuracy, ?\DateTimeImmutable $at = null): array
-    {
+    /**
+     * @param bool  $enforceMaxAge false pour la synchro Unidevpro : un bus garé depuis plus de 24 h
+     *                             doit quand même apparaître au lieu de « Aucun signal ».
+     * @param ?bool $ignition      contact allumé / coupé (null = inconnu)
+     * @return array{0: bool, 1: ?string} [accepté, erreur]
+     */
+    public function record(
+        int $busId, float $lat, float $lng, ?float $speed, ?int $heading, ?int $accuracy,
+        ?\DateTimeImmutable $at = null, bool $enforceMaxAge = true,
+        ?bool $ignition = null, ?float $odometerKm = null
+    ): array {
         $utc = new \DateTimeZone('UTC');
         $now = new \DateTimeImmutable('now', $utc);
         $at = $at ? $at->setTimezone($utc) : $now;
@@ -26,10 +34,11 @@ final class PositionService
         if ($at > $now->modify('+2 minutes')) {
             return [false, 'Horodatage dans le futur.'];
         }
-        if ($at < $now->modify('-24 hours')) {
+        if ($enforceMaxAge && $at < $now->modify('-24 hours')) {
             return [false, 'Horodatage trop ancien (24 h maximum).'];
         }
         $heading = $heading === null ? null : $heading % 360;
+        $ign = $ignition === null ? null : (int) $ignition;
 
         $mission = $this->db->fetchAssociative(
             "SELECT id, driver_id FROM bus_missions WHERE bus_id = ? AND status = 'in_progress' ORDER BY starts_at DESC LIMIT 1",
@@ -45,22 +54,25 @@ final class PositionService
         $this->db->insert('vehicle_positions', [
             'bus_id' => $busId, 'mission_id' => $missionId, 'driver_id' => $driverId,
             'lat' => $lat, 'lng' => $lng, 'speed_kmh' => $speed, 'heading' => $heading,
-            'accuracy_m' => $accuracy, 'recorded_at' => $when,
+            'accuracy_m' => $accuracy, 'ignition' => $ign, 'recorded_at' => $when,
         ]);
 
-        // Dernière position : une position plus ancienne n'écrase jamais une plus récente
+        // Dernière position : une position plus ancienne n'écrase jamais une plus récente.
+        // recorded_at doit rester la dernière affectation (MySQL évalue de gauche à droite).
         $this->db->executeStatement(
-            'INSERT INTO bus_last_position (bus_id, mission_id, driver_id, lat, lng, speed_kmh, heading, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            'INSERT INTO bus_last_position (bus_id, mission_id, driver_id, lat, lng, speed_kmh, heading, ignition, odometer_km, recorded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
-               mission_id = IF(VALUES(recorded_at) >= recorded_at, VALUES(mission_id), mission_id),
-               driver_id  = IF(VALUES(recorded_at) >= recorded_at, VALUES(driver_id), driver_id),
-               lat        = IF(VALUES(recorded_at) >= recorded_at, VALUES(lat), lat),
-               lng        = IF(VALUES(recorded_at) >= recorded_at, VALUES(lng), lng),
-               speed_kmh  = IF(VALUES(recorded_at) >= recorded_at, VALUES(speed_kmh), speed_kmh),
-               heading    = IF(VALUES(recorded_at) >= recorded_at, VALUES(heading), heading),
+               mission_id  = IF(VALUES(recorded_at) >= recorded_at, VALUES(mission_id), mission_id),
+               driver_id   = IF(VALUES(recorded_at) >= recorded_at, VALUES(driver_id), driver_id),
+               lat         = IF(VALUES(recorded_at) >= recorded_at, VALUES(lat), lat),
+               lng         = IF(VALUES(recorded_at) >= recorded_at, VALUES(lng), lng),
+               speed_kmh   = IF(VALUES(recorded_at) >= recorded_at, VALUES(speed_kmh), speed_kmh),
+               heading     = IF(VALUES(recorded_at) >= recorded_at, VALUES(heading), heading),
+               ignition    = IF(VALUES(recorded_at) >= recorded_at, VALUES(ignition), ignition),
+               odometer_km = IF(VALUES(recorded_at) >= recorded_at, COALESCE(VALUES(odometer_km), odometer_km), odometer_km),
                recorded_at = IF(VALUES(recorded_at) >= recorded_at, VALUES(recorded_at), recorded_at)',
-            [$busId, $missionId, $driverId, $lat, $lng, $speed, $heading, $when]
+            [$busId, $missionId, $driverId, $lat, $lng, $speed, $heading, $ign, $odometerKm, $when]
         );
 
         return [true, null];
